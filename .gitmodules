@@ -1,0 +1,3 @@
+[submodule "w3schools"]
+	path = w3schools
+	url = git@github.com:ericsonweah/rust-clinic-w3schools.git
