@@ -1,0 +1,230 @@
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
+use std::thread;
+use regex::Regex;
+
+//
+// ---------- HttpRequest ----------
+//
+#[derive(Debug, Clone)]
+pub struct HttpRequest {
+    pub path: String,
+    pub params: HashMap<String, String>,
+}
+
+//
+// ---------- HttpResponse ----------
+//
+#[derive(Debug, Clone)]
+pub struct HttpResponse {
+    pub status: String,
+    pub headers: HashMap<String, String>,
+    pub body: String,
+}
+
+impl HttpResponse {
+    pub fn ok(body: &str) -> Self {
+        let mut headers = HashMap::new();
+        headers.insert("Content-Type".into(), "text/plain".into());
+        headers.insert("Content-Length".into(), body.len().to_string());
+        Self {
+            status: "HTTP/1.1 200 OK".into(),
+            headers,
+            body: body.into(),
+        }
+    }
+
+    pub fn with_status(code: u16, body: &str, content_type: &str) -> Self {
+        let mut headers = HashMap::new();
+        headers.insert("Content-Type".into(), content_type.into());
+        headers.insert("Content-Length".into(), body.len().to_string());
+        Self {
+            status: format!("HTTP/1.1 {} CUSTOM", code),
+            headers,
+            body: body.into(),
+        }
+    }
+
+    pub fn to_string(&self) -> String {
+        let mut resp = format!("{}\r\n", self.status);
+        for (k, v) in &self.headers {
+            resp.push_str(&format!("{}: {}\r\n", k, v));
+        }
+        resp.push_str("\r\n");
+        resp.push_str(&self.body);
+        resp
+    }
+}
+
+//
+// ---------- res module ----------
+//
+pub mod res {
+    use super::HttpResponse;
+
+    pub fn ok(body: &str) -> HttpResponse {
+        HttpResponse::ok(body)
+    }
+
+    pub fn not_found(body: &str) -> HttpResponse {
+        HttpResponse::with_status(404, body, "text/plain")
+    }
+
+    pub fn json(body: &str) -> HttpResponse {
+        HttpResponse::with_status(200, body, "application/json")
+    }
+}
+
+//
+// ---------- Route matcher ----------
+//
+fn match_route(pattern: &str, path: &str) -> Option<HashMap<String, String>> {
+    let pat_parts: Vec<&str> = pattern.trim_matches('/').split('/').collect();
+    let path_parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+
+    let mut params = HashMap::new();
+
+    let mut i = 0;
+    while i < pat_parts.len() {
+        let p = pat_parts[i];
+        let a = path_parts.get(i).unwrap_or(&"");
+
+        if p == "*" {
+            // Wildcard: capture rest of the path
+            let rest = path_parts[i..].join("/");
+            params.insert("wildcard".to_string(), rest);
+            return Some(params);
+        } else if p.starts_with(':') {
+            // Named param, maybe regex
+            if let Some(open) = p.find('(') {
+                let name = &p[1..open];
+                let regex_pat = &p[open..];
+                let re = Regex::new(regex_pat).ok()?;
+                if re.is_match(a) {
+                    params.insert(name.to_string(), a.to_string());
+                } else {
+                    return None;
+                }
+            } else {
+                let name = &p[1..];
+                params.insert(name.to_string(), a.to_string());
+            }
+        } else if p != *a {
+            return None;
+        }
+        i += 1;
+    }
+
+    if pat_parts.len() != path_parts.len() && !pat_parts.contains(&"*") {
+        return None;
+    }
+
+    Some(params)
+}
+
+//
+// ---------- App ----------
+//
+pub struct App {
+    routes: Arc<Vec<(String, String, Box<dyn Fn(HttpRequest) -> HttpResponse + Send + Sync>)>>,
+}
+
+impl App {
+    pub fn new() -> Self {
+        Self {
+            routes: Arc::new(Vec::new()),
+        }
+    }
+
+    pub fn get<F>(&mut self, path: &str, handler: F)
+    where
+        F: Fn(HttpRequest) -> HttpResponse + Send + Sync + 'static,
+    {
+        Arc::get_mut(&mut self.routes)
+            .unwrap()
+            .push(("GET".into(), path.into(), Box::new(handler)));
+    }
+
+    pub fn listen(self, addr: &str) -> std::io::Result<()> {
+        let listener = TcpListener::bind(addr)?;
+        println!("Server running at http://{}", addr);
+
+        for stream in listener.incoming() {
+            let stream = stream?;
+            let routes = self.routes.clone();
+            thread::spawn(move || {
+                handle_connection(stream, routes);
+            });
+        }
+        Ok(())
+    }
+}
+
+//
+// ---------- Connection Handler ----------
+//
+fn handle_connection(
+    mut stream: TcpStream,
+    routes: Arc<Vec<(String, String, Box<dyn Fn(HttpRequest) -> HttpResponse + Send + Sync>)>>,
+) {
+    let mut buffer = [0; 512];
+    let _ = stream.read(&mut buffer);
+
+    let req_str = String::from_utf8_lossy(&buffer);
+    let mut lines = req_str.lines();
+    let request_line = lines.next().unwrap_or("");
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
+
+    let response = if parts.len() >= 2 {
+        let method = parts[0];
+        let path = parts[1];
+
+        let mut resp = res::not_found("404 Not Found");
+        for (m, pattern, handler) in routes.iter() {
+            if m == method {
+                if let Some(params) = match_route(pattern, path) {
+                    let req = HttpRequest {
+                        path: path.into(),
+                        params,
+                    };
+                    resp = handler(req);
+                    break;
+                }
+            }
+        }
+        resp
+    } else {
+        res::not_found("400 Bad Request")
+    };
+
+    let resp_str = response.to_string();
+    let _ = stream.write_all(resp_str.as_bytes());
+    let _ = stream.flush();
+}
+
+//
+// ---------- main ----------
+//
+fn main() {
+    let mut app = App::new();
+
+    app.get("/", |_req| {
+        res::ok("Welcome to RawExpress with params, wildcards, and regex!")
+    });
+
+    app.get("/users/:id", |req| {
+        res::ok(&format!("User ID is {}", req.params["id"]))
+    });
+
+    app.get("/files/*", |req| {
+        res::ok(&format!("File path: {}", req.params["wildcard"]))
+    });
+
+    app.get("/posts/:id([0-9]+)", |req| {
+        res::ok(&format!("Post ID is {}", req.params["id"]))
+    });
+
+    app.listen("127.0.0.1:3000").unwrap();
+}

@@ -1,0 +1,1 @@
+dyn Fn(HttpRequest) -> Pin<Box<dyn futures::Future<Output = HttpResponse> + std::marker::Send>>
