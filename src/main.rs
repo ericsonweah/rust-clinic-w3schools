@@ -1,11 +1,20 @@
 
 
-use std::collections::HashMap;
+
 
 fn main (){
-  
-  let mut capital_cities = HashMap::new();
-  capital_cities.insert("France", "Paris");
-  capital_cities.insert("Germany", "Berlin");
-  println!("{:?}", capital_cities);
+
+  enum LoginStatus {
+    Success(String),
+   Error(String),
+  }
+
+  let result1 = LoginStatus::Success(String::from("Welcome back"));
+  let _result2 = LoginStatus::Error(String::from("Incorrect password"));  
+
+
+  match result1 {
+    LoginStatus::Success(msg) => println!("{}", msg),
+    LoginStatus::Error(msg) => println!("{}", msg),
+  }
 }
